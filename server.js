@@ -1,9 +1,20 @@
 /**
- * Link Önizleme / Tıklama Takip Servisi
+ * Link Önizleme / Tıklama Takip Servisi (v2)
  * ---------------------------------------
- * KVKK onaylı müşterilere kısa mesajla gönderilen linklerin
- * "önizleme" (mesajlaşma uygulaması tarafından otomatik çekilen)
- * mi yoksa "gerçek tıklama" mı olduğunu ayırt edip raporlar.
+ * Artık User-Agent tahminine değil, GERÇEK DAVRANIŞA dayanıyor:
+ *
+ *   GET /r/:code            -> görünmez "ara sayfa" (HTML) döner.
+ *                              Bu sayfanın <head>'inde bir og:image etiketi var
+ *                              ve JavaScript'i çalıştığında /confirm'e bir sinyal
+ *                              gönderip ASIL hedefe yönlendiriyor.
+ *
+ *   GET /px/:code/:vid.png   -> 1x1 şeffaf görsel. Önizleme oluşturan uygulamalar
+ *                              (WhatsApp, Telegram, iMessage "Tap to Load Preview" vb.)
+ *                              JavaScript ÇALIŞTIRMADAN sadece bu görseli çeker.
+ *                              Bu istek geldiyse ve /confirm gelmediyse -> ÖNİZLEME.
+ *
+ *   POST /confirm/:code/:vid -> Sadece gerçek bir tarayıcı JavaScript çalıştırıp
+ *                               buraya istek atabilir. Bu geldiyse -> GERÇEK TIKLAMA.
  *
  * Çalıştırma:
  *   npm install
@@ -11,7 +22,7 @@
  *
  * Ortam değişkeni:
  *   PORT (varsayılan 3000)
- *   BASE_URL (örn: https://linktakip.sizinalanadiniz.com)
+ *   BASE_URL (örn: https://smartsmsenis.onrender.com)
  */
 
 const express = require("express");
@@ -26,6 +37,12 @@ const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const DB_PATH = path.join(__dirname, "db.json");
 
+// 1x1 şeffaf PNG (önizleme görseli olarak kullanılıyor)
+const PIXEL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64"
+);
+
 // ---------- Basit JSON veritabanı ----------
 function loadDb() {
   if (!fs.existsSync(DB_PATH)) {
@@ -38,50 +55,12 @@ function saveDb(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
 }
 
-// ---------- Önizleme (bot) tespiti ----------
-// Mesajlaşma / sosyal platformların link önizlemesi oluşturmak için
-// kendi sunucularından attığı isteklerin User-Agent imzaları.
-const PREVIEW_BOT_PATTERNS = [
-  /WhatsApp/i,
-  /facebookexternalhit/i,
-  /Facebot/i,
-  /TelegramBot/i,
-  /Slackbot/i,
-  /Slack-ImgProxy/i,
-  /Twitterbot/i,
-  /SkypeUriPreview/i,
-  /Discordbot/i,
-  /LinkedInBot/i,
-  /vkShare/i,
-  /Google-InspectionTool/i,
-  /GoogleImageProxy/i,
-  /Applebot/i,
-  /Bitly/i,
-  /Iframely/i,
-  /Embedly/i,
-  /redditbot/i,
-  /viber/i,
-];
-
-// Gerçek bir mobil tarayıcıdan geldiğini gösteren tipik imzalar
-const REAL_BROWSER_PATTERNS = [
-  /Mobile Safari/i,
-  /CriOS/i, // Chrome iOS
-  /FxiOS/i, // Firefox iOS
-  /Version\/.*Mobile/i,
-  /Android.*Chrome/i,
-  /SamsungBrowser/i,
-];
-
-function classifyRequest(userAgent = "") {
-  const ua = userAgent || "";
-  if (PREVIEW_BOT_PATTERNS.some((re) => re.test(ua))) return "onizleme";
-  if (REAL_BROWSER_PATTERNS.some((re) => re.test(ua))) return "tiklama";
-  return "belirsiz";
+function generateCode() {
+  return crypto.randomBytes(4).toString("hex");
 }
 
-function generateCode() {
-  return crypto.randomBytes(4).toString("hex"); // 8 karakterlik kısa kod
+function generateVid() {
+  return crypto.randomBytes(6).toString("hex");
 }
 
 function getClientIp(req) {
@@ -90,8 +69,14 @@ function getClientIp(req) {
   return req.socket.remoteAddress;
 }
 
+function logEvent(db, code, entry) {
+  const link = db.links[code];
+  if (!link) return;
+  link.events.push(entry);
+  saveDb(db);
+}
+
 // ---------- API: Yeni takip linki oluştur ----------
-// body: { destination: "https://...", customer: "Ad Soyad (opsiyonel)", campaign: "opsiyonel etiket" }
 app.post("/api/links", (req, res) => {
   const { destination, customer, campaign } = req.body || {};
   if (!destination || !/^https?:\/\//i.test(destination)) {
@@ -107,7 +92,7 @@ app.post("/api/links", (req, res) => {
     customer: customer || null,
     campaign: campaign || null,
     createdAt: new Date().toISOString(),
-    events: [],
+    events: [], // {timestamp, ip, userAgent, type, vid}
   };
   saveDb(db);
 
@@ -118,44 +103,131 @@ app.post("/api/links", (req, res) => {
   });
 });
 
-// ---------- Tüm linkleri listele ----------
+// ---------- Tüm linkleri özet halinde listele ----------
+function summarize(link) {
+  const byVid = {};
+  for (const e of link.events) {
+    if (!e.vid) continue;
+    byVid[e.vid] = byVid[e.vid] || {};
+    byVid[e.vid][e.type] = true;
+    byVid[e.vid].lastTs = e.timestamp;
+  }
+
+  let onizleme = 0;
+  let tiklama = 0;
+  let belirsiz = 0;
+  let ilkOnizleme = null;
+  let ilkTiklama = null;
+
+  for (const vid of Object.keys(byVid)) {
+    const flags = byVid[vid];
+    if (flags.tiklama_onay) {
+      tiklama++;
+      if (!ilkTiklama || flags.lastTs < ilkTiklama) ilkTiklama = flags.lastTs;
+    } else if (flags.onizleme_gorsel) {
+      onizleme++;
+      if (!ilkOnizleme || flags.lastTs < ilkOnizleme) ilkOnizleme = flags.lastTs;
+    } else {
+      belirsiz++;
+    }
+  }
+
+  return { onizleme, tiklama, belirsiz, ilkOnizleme, ilkTiklama };
+}
+
 app.get("/api/links", (req, res) => {
   const db = loadDb();
-  const list = Object.values(db.links).map((l) => ({
-    code: l.code,
-    destination: l.destination,
-    customer: l.customer,
-    campaign: l.campaign,
-    createdAt: l.createdAt,
-    onizlemeSayisi: l.events.filter((e) => e.type === "onizleme").length,
-    tiklamaSayisi: l.events.filter((e) => e.type === "tiklama").length,
-  }));
+  const list = Object.values(db.links).map((l) => {
+    const s = summarize(l);
+    return {
+      code: l.code,
+      destination: l.destination,
+      customer: l.customer,
+      campaign: l.campaign,
+      createdAt: l.createdAt,
+      onizlemeSayisi: s.onizleme,
+      tiklamaSayisi: s.tiklama,
+    };
+  });
   res.json(list);
 });
 
-// ---------- Müşteriye gönderilecek asıl link ----------
-// Bu URL SMS içine konur. İstek geldiğinde loglanır ve hedefe yönlendirilir.
+// ---------- SMS/WhatsApp'a konacak asıl link: görünmez ara sayfa ----------
 app.get("/r/:code", (req, res) => {
   const db = loadDb();
   const link = db.links[req.params.code];
+  if (!link) return res.status(404).send("Link bulunamadı.");
 
-  if (!link) {
-    return res.status(404).send("Link bulunamadı.");
-  }
+  const vid = generateVid();
+  const code = req.params.code;
 
-  const userAgent = req.headers["user-agent"] || "";
-  const type = classifyRequest(userAgent);
-
-  link.events.push({
+  logEvent(db, code, {
     timestamp: new Date().toISOString(),
     ip: getClientIp(req),
-    userAgent,
-    type, // "onizleme" | "tiklama" | "belirsiz"
-    method: req.method,
+    userAgent: req.headers["user-agent"] || "",
+    type: "sayfa_istegi",
+    vid,
   });
-  saveDb(db);
 
-  res.redirect(302, link.destination);
+  const pixelUrl = `${BASE_URL}/px/${code}/${vid}.png`;
+  const destJson = JSON.stringify(link.destination);
+  const destAttr = link.destination.replace(/"/g, "&quot;");
+
+  res.set("Cache-Control", "no-store");
+  res.send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta property="og:title" content="Yönlendiriliyor..." />
+<meta property="og:image" content="${pixelUrl}" />
+<noscript><meta http-equiv="refresh" content="0;url=${destAttr}" /></noscript>
+</head>
+<body>
+<script>
+(function () {
+  var dest = ${destJson};
+  try {
+    fetch("/confirm/${code}/${vid}", { method: "POST", keepalive: true }).catch(function () {});
+  } catch (e) {}
+  window.location.replace(dest);
+})();
+</script>
+</body>
+</html>`);
+});
+
+// ---------- Önizleme görseli (bot/uygulama tarafından JS çalışmadan çekilir) ----------
+app.get("/px/:code/:vid.png", (req, res) => {
+  const db = loadDb();
+  const { code, vid } = req.params;
+
+  logEvent(db, code, {
+    timestamp: new Date().toISOString(),
+    ip: getClientIp(req),
+    userAgent: req.headers["user-agent"] || "",
+    type: "onizleme_gorsel",
+    vid,
+  });
+
+  res.set("Content-Type", "image/png");
+  res.set("Cache-Control", "no-store");
+  res.send(PIXEL_PNG);
+});
+
+// ---------- Gerçek tıklama onayı (sadece JS çalıştıran gerçek tarayıcı buraya gelir) ----------
+app.post("/confirm/:code/:vid", (req, res) => {
+  const db = loadDb();
+  const { code, vid } = req.params;
+
+  logEvent(db, code, {
+    timestamp: new Date().toISOString(),
+    ip: getClientIp(req),
+    userAgent: req.headers["user-agent"] || "",
+    type: "tiklama_onay",
+    vid,
+  });
+
+  res.sendStatus(204);
 });
 
 // ---------- Tek bir linkin raporu ----------
@@ -164,8 +236,7 @@ app.get("/api/report/:code", (req, res) => {
   const link = db.links[req.params.code];
   if (!link) return res.status(404).json({ error: "Link bulunamadı." });
 
-  const previews = link.events.filter((e) => e.type === "onizleme");
-  const clicks = link.events.filter((e) => e.type === "tiklama");
+  const s = summarize(link);
 
   res.json({
     code: link.code,
@@ -174,11 +245,11 @@ app.get("/api/report/:code", (req, res) => {
     campaign: link.campaign,
     createdAt: link.createdAt,
     ozet: {
-      onizlemeSayisi: previews.length,
-      tiklamaSayisi: clicks.length,
-      belirsizSayisi: link.events.length - previews.length - clicks.length,
-      ilkOnizlemeZamani: previews[0]?.timestamp || null,
-      ilkTiklamaZamani: clicks[0]?.timestamp || null,
+      onizlemeSayisi: s.onizleme,
+      tiklamaSayisi: s.tiklama,
+      belirsizSayisi: s.belirsiz,
+      ilkOnizlemeZamani: s.ilkOnizleme,
+      ilkTiklamaZamani: s.ilkTiklama,
     },
     events: link.events,
   });

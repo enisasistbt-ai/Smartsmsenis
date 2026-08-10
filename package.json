@@ -1,0 +1,13 @@
+{
+  "name": "link-onizleme-raporu",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SMS ile gönderilen linklerin onizlenme/tiklanma raporunu tutan basit servis",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
